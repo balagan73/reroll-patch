@@ -81,8 +81,8 @@ OUTPUT
 
 REQUIREMENTS
     - Must be run from the root of a git repository
-    - The patch file must contain a "Date:" field
     - Git must be installed and configured
+    - If patch has no "Date:" field, will search commit history (slower)
 
 NOTES
     - The script preserves your current branch and working directory state
@@ -218,12 +218,14 @@ else
         exit 1
     fi
 
-    # Extract patch date from the patch file
+    # Try to extract patch date from the patch file (optional)
     PATCH_DATE=$(grep "^Date:" "$PATCH_FILE" | head -1 | sed 's/Date: //')
-    if [ -z "$PATCH_DATE" ]; then
-        echo "❌ ERROR: Could not find Date field in patch file"
-        echo "The patch file must contain a 'Date:' field"
-        exit 1
+    if [ -n "$PATCH_DATE" ]; then
+        echo "📅 Found patch date: $PATCH_DATE"
+        USE_DATE_SEARCH=true
+    else
+        echo "ℹ️  No Date field found - will search commit history"
+        USE_DATE_SEARCH=false
     fi
 
     # Save state for potential resume
@@ -234,7 +236,6 @@ else
     echo "📄 Patch file: $PATCH_FILE"
     echo "🔢 Issue number: $ISSUE_NUMBER"
     echo "🎯 Target branch: $TARGET_BRANCH"
-    echo "📅 Patch date: $PATCH_DATE"
     echo ""
 
     # Step 1: Ensure we're on the target branch
@@ -258,18 +259,77 @@ else
     echo "❌ Patch doesn't apply. Proceeding with reroll..."
     echo ""
 
-    # Step 3: Find the commit closest to the patch date
-    echo "🔍 Finding historical commit from patch date..."
-    HISTORICAL_COMMIT=$(git log --before="$PATCH_DATE" --format="%H" -1)
-    if [ -z "$HISTORICAL_COMMIT" ]; then
-        echo "❌ ERROR: Could not find a commit before the patch date"
-        echo "The patch might be older than your git history"
-        clear_state
-        exit 1
+    # Step 3: Find the historical commit where the patch can be applied
+    if [ "$USE_DATE_SEARCH" == "true" ]; then
+        echo "🔍 Finding historical commit from patch date..."
+        HISTORICAL_COMMIT=$(git log --before="$PATCH_DATE" --format="%H" -1)
+        if [ -z "$HISTORICAL_COMMIT" ]; then
+            echo "❌ ERROR: Could not find a commit before the patch date"
+            echo "The patch might be older than your git history"
+            clear_state
+            exit 1
+        fi
+        HISTORICAL_COMMIT_SHORT=$(echo $HISTORICAL_COMMIT | cut -c1-7)
+        echo "📌 Found commit: $HISTORICAL_COMMIT_SHORT"
+        echo ""
+    else
+        echo "🔍 Searching for historical commit where patch applies..."
+        echo "   Using binary search through commit history..."
+
+        # Get all commits in reverse chronological order
+        ALL_COMMITS=($(git log --format="%H" -1000))
+        TOTAL_COMMITS=${#ALL_COMMITS[@]}
+
+        echo "   Searching through last $TOTAL_COMMITS commits..."
+
+        # First, check if patch applies to the oldest commit in our range
+        oldest_commit="${ALL_COMMITS[$((TOTAL_COMMITS-1))]}"
+        if ! git checkout -q "$oldest_commit" 2>/dev/null || ! git apply --check "$PATCH_FILE" 2>/dev/null; then
+            git checkout -q "$TARGET_BRANCH" 2>/dev/null
+            echo "❌ ERROR: Patch doesn't apply even to the oldest commit in range"
+            echo "   Searched the last $TOTAL_COMMITS commits without finding a match"
+            echo ""
+            echo "This could mean:"
+            echo "  - The patch is for a different branch"
+            echo "  - The patch is very old (>1000 commits)"
+            echo "  - The patch file is corrupted"
+            clear_state
+            exit 1
+        fi
+
+        echo "   ✓ Patch applies to oldest commit, searching for most recent..."
+
+        # Binary search to find the most recent commit where patch applies
+        # left = doesn't apply (newer), right = applies (older)
+        left=0
+        right=$((TOTAL_COMMITS - 1))
+        result_index=$right
+
+        while [ $left -le $right ]; do
+            mid=$(((left + right) / 2))
+            commit="${ALL_COMMITS[$mid]}"
+
+            echo "   Testing commit $((mid+1))/$TOTAL_COMMITS..."
+
+            if git checkout -q "$commit" 2>/dev/null && git apply --check "$PATCH_FILE" 2>/dev/null; then
+                # Patch applies - this could be our answer, but try to find a more recent one
+                result_index=$mid
+                right=$((mid - 1))  # Search in newer commits (lower indices)
+            else
+                # Patch doesn't apply - search in older commits (higher indices)
+                left=$((mid + 1))
+            fi
+        done
+
+        HISTORICAL_COMMIT="${ALL_COMMITS[$result_index]}"
+
+        # Return to target branch
+        git checkout -q "$TARGET_BRANCH" 2>/dev/null
+
+        HISTORICAL_COMMIT_SHORT=$(echo $HISTORICAL_COMMIT | cut -c1-7)
+        echo "✅ Found most recent applicable commit: $HISTORICAL_COMMIT_SHORT (commit $((result_index+1))/$TOTAL_COMMITS)"
+        echo ""
     fi
-    HISTORICAL_COMMIT_SHORT=$(echo $HISTORICAL_COMMIT | cut -c1-7)
-    echo "📌 Found commit: $HISTORICAL_COMMIT_SHORT"
-    echo ""
 
     # Step 4: Create test branch from historical commit
     echo "🌿 Creating test branch: $TEST_BRANCH"
