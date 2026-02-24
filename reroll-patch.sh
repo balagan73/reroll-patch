@@ -1,15 +1,353 @@
 #!/bin/bash
 # reroll-patch.sh - Automates Drupal patch rerolling
-# Version: 1.1
+# Version: 2.0
 
-set -e  # Exit on any error
+set -euo pipefail
 
-# State file to track reroll progress
+# Global state
 STATE_FILE=".reroll-state"
+FORCE=false
+ORIGINAL_BRANCH=""
+CLEANUP_DONE=false
 
-# Help documentation
+# ═══════════════════════════════════════════════════════════════════════
+# Logging helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+log_info()    { echo "ℹ️  $*"; }
+log_success() { echo "✅ $*"; }
+log_error()   { echo "❌ ERROR: $*"; }
+log_warning() { echo "⚠️  WARNING: $*"; }
+
+# ═══════════════════════════════════════════════════════════════════════
+# State management
+# ═══════════════════════════════════════════════════════════════════════
+
+save_state() {
+    cat > "$STATE_FILE" <<EOF
+PATCH_FILE=$PATCH_FILE
+ISSUE_NUMBER=$ISSUE_NUMBER
+TARGET_BRANCH=$TARGET_BRANCH
+TEST_BRANCH=$TEST_BRANCH
+ORIGINAL_BRANCH=$ORIGINAL_BRANCH
+EOF
+}
+
+load_state() {
+    if [ ! -f "$STATE_FILE" ]; then
+        return 1
+    fi
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PATCH_FILE)       PATCH_FILE="$value" ;;
+            ISSUE_NUMBER)     ISSUE_NUMBER="$value" ;;
+            TARGET_BRANCH)    TARGET_BRANCH="$value" ;;
+            TEST_BRANCH)      TEST_BRANCH="$value" ;;
+            ORIGINAL_BRANCH)  ORIGINAL_BRANCH="$value" ;;
+        esac
+    done < "$STATE_FILE"
+}
+
+clear_state() {
+    [ -f "$STATE_FILE" ] && rm "$STATE_FILE"
+}
+
+is_rebase_in_progress() {
+    [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Branch save/restore and cleanup
+# ═══════════════════════════════════════════════════════════════════════
+
+save_original_branch() {
+    ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$ORIGINAL_BRANCH" == "HEAD" ]; then
+        ORIGINAL_BRANCH=$(git rev-parse HEAD)
+    fi
+}
+
+restore_original_branch() {
+    if [ -n "$ORIGINAL_BRANCH" ]; then
+        git checkout -q "$ORIGINAL_BRANCH" 2>/dev/null || true
+    fi
+}
+
+cleanup_on_exit() {
+    if [ "$CLEANUP_DONE" = true ]; then
+        return
+    fi
+    CLEANUP_DONE=true
+
+    # Only restore if we're not in a rebase (user needs to resolve conflicts)
+    if ! is_rebase_in_progress; then
+        restore_original_branch
+    fi
+}
+
+trap cleanup_on_exit EXIT INT TERM
+
+# ═══════════════════════════════════════════════════════════════════════
+# Confirm prompt (respects --force)
+# ═══════════════════════════════════════════════════════════════════════
+
+confirm_or_abort() {
+    local message="$1"
+    if [ "$FORCE" = true ]; then
+        return 0
+    fi
+    echo "$message (y/n)"
+    read -r response
+    if [ "$response" != "y" ]; then
+        echo "Aborted."
+        exit 1
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Core workflow functions
+# ═══════════════════════════════════════════════════════════════════════
+
+check_patch_applies() {
+    echo "🔍 Checking if patch applies cleanly..."
+    if git apply --check "$PATCH_FILE" 2>/dev/null; then
+        log_success "Patch applies cleanly! No reroll needed."
+        echo ""
+        log_info "You can apply this patch with: git apply $PATCH_FILE"
+        clear_state
+        exit 0
+    fi
+    log_info "Patch doesn't apply cleanly. Proceeding with reroll..."
+    echo ""
+}
+
+find_historical_commit() {
+    local patch_date
+    patch_date=$(grep "^Date:" "$PATCH_FILE" | head -1 | sed 's/Date: //') || true
+
+    if [ -n "$patch_date" ]; then
+        find_commit_by_date "$patch_date"
+    else
+        log_info "No Date field found — searching commit history..."
+        find_commit_by_binary_search
+    fi
+}
+
+find_commit_by_date() {
+    local patch_date="$1"
+    echo "📅 Found patch date: $patch_date"
+
+    HISTORICAL_COMMIT=$(git log --before="$patch_date" --format="%H" -1)
+    if [ -z "$HISTORICAL_COMMIT" ]; then
+        log_error "Could not find a commit before the patch date"
+        echo "The patch might be older than your git history"
+        clear_state
+        exit 1
+    fi
+    log_success "Found commit: ${HISTORICAL_COMMIT:0:7}"
+    echo ""
+}
+
+find_commit_by_binary_search() {
+    echo "   Using binary search through commit history..."
+
+    local -a all_commits
+    mapfile -t all_commits < <(git log --format="%H")
+    local total=${#all_commits[@]}
+
+    echo "   Searching through $total commits..."
+
+    # Check oldest commit first
+    local oldest="${all_commits[$((total - 1))]}"
+    if ! git checkout -q "$oldest" 2>/dev/null || ! git apply --check "$PATCH_FILE" 2>/dev/null; then
+        git checkout -q "$TARGET_BRANCH" 2>/dev/null || true
+        log_error "Patch doesn't apply even to the oldest commit"
+        echo ""
+        echo "This could mean:"
+        echo "  - The patch is for a different branch"
+        echo "  - The patch file is corrupted"
+        clear_state
+        exit 1
+    fi
+
+    echo "   ✓ Patch applies to oldest commit, searching for most recent..."
+
+    # Binary search: find most recent commit where patch applies
+    local left=0 right=$((total - 1)) mid result_index=$right
+    while [ $left -le $right ]; do
+        mid=$(((left + right) / 2))
+        echo "   Testing commit $((mid + 1))/$total..."
+
+        if git checkout -q "${all_commits[$mid]}" 2>/dev/null && git apply --check "$PATCH_FILE" 2>/dev/null; then
+            result_index=$mid
+            right=$((mid - 1))
+        else
+            left=$((mid + 1))
+        fi
+    done
+
+    HISTORICAL_COMMIT="${all_commits[$result_index]}"
+    git checkout -q "$TARGET_BRANCH" 2>/dev/null || true
+
+    log_success "Found most recent applicable commit: ${HISTORICAL_COMMIT:0:7} (commit $((result_index + 1))/$total)"
+    echo ""
+}
+
+create_test_branch() {
+    echo "🌿 Creating test branch: $TEST_BRANCH"
+
+    if git rev-parse --verify "$TEST_BRANCH" >/dev/null 2>&1; then
+        log_warning "Branch '$TEST_BRANCH' already exists"
+        confirm_or_abort "Delete it and continue?"
+        git branch -D "$TEST_BRANCH"
+    fi
+
+    git checkout -b "$TEST_BRANCH" "$HISTORICAL_COMMIT"
+    echo ""
+}
+
+apply_patch_to_history() {
+    echo "📝 Applying patch to historical code..."
+    if git apply --index "$PATCH_FILE" 2>/dev/null; then
+        log_success "Patch applied"
+    elif git apply --3way --index "$PATCH_FILE"; then
+        log_success "Patch applied (using 3-way merge)"
+    else
+        log_error "Patch doesn't apply to historical code!"
+        echo ""
+        echo "This could mean:"
+        echo "  - The patch date is incorrect"
+        echo "  - The patch is for a different branch"
+        echo "  - The patch file is corrupted"
+        echo ""
+        echo "🧹 Cleaning up..."
+        git checkout "$TARGET_BRANCH"
+        git branch -D "$TEST_BRANCH"
+        clear_state
+        exit 1
+    fi
+
+    echo "💾 Committing patch..."
+    git commit -m "Applying patch from issue $ISSUE_NUMBER"
+    echo ""
+}
+
+rebase_onto_target() {
+    echo "🔀 Rebasing onto $TARGET_BRANCH..."
+    if git rebase "$TARGET_BRANCH"; then
+        log_success "Rebase successful! No conflicts."
+        echo ""
+    else
+        echo ""
+        echo "⚠️  ════════════════════════════════════════════════════════"
+        echo "⚠️  CONFLICTS DETECTED - Manual Resolution Required"
+        echo "⚠️  ════════════════════════════════════════════════════════"
+        echo ""
+        echo "📝 To resolve conflicts:"
+        echo "   1. Edit the conflicted files (look for <<<<<<< and >>>>>>>)"
+        echo "   2. Stage your changes:     git add ."
+        echo "   3. Re-run this script:     ./reroll-patch.sh --resume"
+        echo ""
+        echo "To abort the rebase:          git rebase --abort"
+        echo ""
+        exit 2
+    fi
+}
+
+generate_output_filename() {
+    local base="${ISSUE_NUMBER}-rerolled"
+    if [ ! -f "${base}.patch" ] || [ "$FORCE" = true ]; then
+        OUTPUT_PATCH="${base}.patch"
+        return
+    fi
+
+    local counter=2
+    while [ -f "${base}-${counter}.patch" ]; do
+        counter=$((counter + 1))
+    done
+    OUTPUT_PATCH="${base}-${counter}.patch"
+}
+
+generate_rerolled_patch() {
+    generate_output_filename
+
+    echo "📄 Generating rerolled patch: $OUTPUT_PATCH"
+    git diff -M "$TARGET_BRANCH" "$TEST_BRANCH" > "$OUTPUT_PATCH"
+    echo ""
+
+    # Verify
+    echo "🔍 Verifying rerolled patch..."
+    git checkout -q "$TARGET_BRANCH"
+    if git apply --check "$OUTPUT_PATCH"; then
+        log_success "Rerolled patch applies cleanly."
+    else
+        log_error "Rerolled patch doesn't apply! Please check the git history."
+        exit 1
+    fi
+
+    # Report
+    echo ""
+    local size
+    size=$(wc -c < "$OUTPUT_PATCH")
+    echo "📊 Results"
+    echo "=========="
+    echo "📄 New patch: $OUTPUT_PATCH"
+    echo "📊 Patch size: $size bytes"
+    if [ "$size" -eq 0 ]; then
+        log_warning "Patch file is empty!"
+    fi
+    echo ""
+    echo "📋 Next Steps"
+    echo "============="
+    echo "1. Review the patch:     cat $OUTPUT_PATCH"
+    echo "2. Apply it:             git apply $OUTPUT_PATCH"
+    echo "3. Test your changes"
+    echo "4. Upload to drupal.org issue #$ISSUE_NUMBER"
+    echo "5. Clean up:             git branch -D $TEST_BRANCH"
+}
+
+handle_resume() {
+    if [ -z "${ISSUE_NUMBER:-}" ] && ! load_state; then
+        log_error "Could not load saved state"
+        echo "State file .reroll-state not found"
+        exit 1
+    fi
+
+    echo "🔄 Resuming reroll for issue $ISSUE_NUMBER"
+    echo "════════════════════════════════════════"
+    echo ""
+
+    if git status | grep -q "Unmerged paths"; then
+        log_error "Conflicts still present"
+        echo ""
+        echo "Please resolve all conflicts first:"
+        echo "  1. Edit the conflicted files"
+        echo "  2. Stage them: git add ."
+        echo "  3. Re-run: ./reroll-patch.sh --resume"
+        exit 1
+    fi
+
+    if ! git diff --cached --quiet; then
+        log_success "Changes staged, continuing rebase..."
+    else
+        log_warning "No staged changes found, attempting to continue anyway..."
+    fi
+
+    if git rebase --continue; then
+        log_success "Rebase completed!"
+        echo ""
+    else
+        log_error "Rebase failed. Please check for remaining conflicts."
+        exit 2
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Help
+# ═══════════════════════════════════════════════════════════════════════
+
 show_help() {
-    cat << EOF
+    cat << 'EOF'
 reroll-patch.sh - Automate Drupal Patch Rerolling
 
 SYNOPSIS
@@ -30,7 +368,7 @@ DESCRIPTION
     7. Verifies the new patch applies
 
     RESUMABLE: If conflicts occur during rebase, resolve them and re-run
-    the script with the same arguments or use --resume to continue.
+    the script with --resume to continue.
 
 ARGUMENTS
     patch-file      Path to the patch file to reroll (required)
@@ -39,6 +377,7 @@ ARGUMENTS
 
 OPTIONS
     -h, --help      Show this help message and exit
+    -f, --force     Skip interactive prompts (auto-yes)
     --resume        Resume from a previously interrupted reroll
 
 EXAMPLES
@@ -47,14 +386,12 @@ EXAMPLES
 
     # After resolving conflicts, resume
     ./reroll-patch.sh --resume
-    # or simply re-run with the same arguments
-    ./reroll-patch.sh 3267304.patch 3267304
 
     # Reroll against a different branch
     ./reroll-patch.sh 3267304.patch 3267304 2.x
 
-    # Show help
-    ./reroll-patch.sh --help
+    # Non-interactive mode (overwrite existing files/branches)
+    ./reroll-patch.sh -f 3267304.patch 3267304
 
 EXIT CODES
     0   Success - patch rerolled or no reroll needed
@@ -69,11 +406,7 @@ HANDLING CONFLICTS
     2. Stage the resolved files:
        git add .
     3. Re-run the script:
-       ./reroll-patch.sh <patch-file> <issue-number> [target-branch]
-       OR
        ./reroll-patch.sh --resume
-
-    The script will automatically detect the in-progress rebase and continue.
 
 OUTPUT
     - <issue-number>-rerolled.patch - The new patch file
@@ -82,128 +415,88 @@ OUTPUT
 REQUIREMENTS
     - Must be run from the root of a git repository
     - Git must be installed and configured
-    - If patch has no "Date:" field, will search commit history (slower)
-
-NOTES
-    - The script preserves your current branch and working directory state
-    - Test branches are prefixed with "test-" to avoid conflicts
-    - The script will not overwrite existing rerolled patch files
-    - State is saved in .reroll-state file for resumability
 
 SEE ALSO
-    Drupal.org documentation on rerolling patches:
     https://www.drupal.org/docs/develop/git/using-git-to-contribute-to-drupal/working-with-patches/rerolling-patches
-
-AUTHOR
-    Generated for Drupal contribution workflow
-
 EOF
 }
 
-# Check for help flag first
-if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
-    show_help
-    exit 0
-fi
+# ═══════════════════════════════════════════════════════════════════════
+# Argument parsing
+# ═══════════════════════════════════════════════════════════════════════
 
-# Check if we're in a git repository
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    echo "❌ ERROR: Not in a git repository"
-    echo "Please run this script from the root of your git project"
-    exit 1
-fi
+parse_args() {
+    RESUME_MODE=false
 
-# Function to save state
-save_state() {
-    echo "PATCH_FILE=$PATCH_FILE" > "$STATE_FILE"
-    echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> "$STATE_FILE"
-    echo "TARGET_BRANCH=$TARGET_BRANCH" >> "$STATE_FILE"
-    echo "TEST_BRANCH=$TEST_BRANCH" >> "$STATE_FILE"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            --resume)
+                RESUME_MODE=true
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    # Remaining positional args
+    PATCH_FILE="${1:-}"
+    ISSUE_NUMBER="${2:-}"
+    TARGET_BRANCH="${3:-8.x-1.x}"
+    TEST_BRANCH="${ISSUE_NUMBER:+test-$ISSUE_NUMBER}"
 }
 
-# Function to load state
-load_state() {
-    if [ -f "$STATE_FILE" ]; then
-        source "$STATE_FILE"
-        return 0
-    fi
-    return 1
-}
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
 
-# Function to clear state
-clear_state() {
-    [ -f "$STATE_FILE" ] && rm "$STATE_FILE"
-}
+main() {
+    parse_args "$@"
 
-# Check if rebase is in progress
-is_rebase_in_progress() {
-    [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]
-}
-
-# Determine if we're in resume mode
-RESUME_MODE=false
-if [ "$1" == "--resume" ]; then
-    RESUME_MODE=true
-elif is_rebase_in_progress && load_state && [ -n "$1" ] && [ -n "$2" ]; then
-    # Auto-detect resume if rebase is in progress, we have saved state,
-    # AND user provided the same patch/issue arguments
-    if [ "$1" == "$PATCH_FILE" ] && [ "$2" == "$ISSUE_NUMBER" ]; then
-        RESUME_MODE=true
-    fi
-fi
-
-# Resume mode logic
-if [ "$RESUME_MODE" == "true" ] && is_rebase_in_progress; then
-    # Load saved state if not already loaded
-    if [ -z "$ISSUE_NUMBER" ] && ! load_state; then
-        echo "❌ ERROR: Could not load saved state"
-        echo "State file .reroll-state not found"
+    # Must be in a git repository
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log_error "Not in a git repository"
+        echo "Please run this script from the root of your git project"
         exit 1
     fi
 
-    echo "🔄 Resuming reroll for issue $ISSUE_NUMBER"
-    echo "════════════════════════════════════════"
-    echo ""
+    save_original_branch
 
-    # Check if there are still conflicts
-    if git status | grep -q "Unmerged paths"; then
-        echo "❌ ERROR: Conflicts still present"
-        echo ""
-        echo "Please resolve all conflicts first:"
-        echo "  1. Edit the conflicted files"
-        echo "  2. Stage them: git add ."
-        echo "  3. Re-run: ./reroll-patch.sh --resume"
+    # Auto-detect resume: rebase in progress + saved state exists
+    if ! $RESUME_MODE && is_rebase_in_progress; then
+        local cli_patch="${PATCH_FILE:-}" cli_issue="${ISSUE_NUMBER:-}"
+        if load_state; then
+            # If user re-ran with same args, or no args, auto-resume
+            if [ -z "$cli_patch" ] || { [ "$cli_patch" = "$PATCH_FILE" ] && [ "$cli_issue" = "$ISSUE_NUMBER" ]; }; then
+                RESUME_MODE=true
+            fi
+        fi
+    fi
+
+    # Handle resume
+    if $RESUME_MODE && is_rebase_in_progress; then
+        handle_resume
+        generate_rerolled_patch
+        restore_original_branch
+        clear_state
+        return
+    elif $RESUME_MODE; then
+        log_error "No rebase in progress"
         exit 1
     fi
 
-    # Check if files are staged
-    if ! git diff --cached --quiet; then
-        echo "✅ Changes staged, continuing rebase..."
-    else
-        echo "⚠️  No staged changes found, attempting to continue anyway..."
-    fi
-
-    if git rebase --continue; then
-        echo "✅ Rebase completed successfully!"
-        echo ""
-    else
-        echo "❌ Rebase failed. Please check for remaining conflicts."
-        exit 2
-    fi
-
-    # Continue to patch generation below
-elif [ "$RESUME_MODE" == "true" ]; then
-    echo "❌ ERROR: No rebase in progress"
-    exit 1
-else
     # Normal mode - validate arguments
-    PATCH_FILE="$1"
-    ISSUE_NUMBER="$2"
-    TARGET_BRANCH="${3:-8.x-1.x}"  # Default to 8.x-1.x if not specified
-    TEST_BRANCH="test-$ISSUE_NUMBER"
-
     if [ -z "$PATCH_FILE" ] || [ -z "$ISSUE_NUMBER" ]; then
-        echo "❌ ERROR: Missing required arguments"
+        log_error "Missing required arguments"
         echo ""
         echo "Usage: ./reroll-patch.sh <patch-file> <issue-number> [target-branch]"
         echo "       ./reroll-patch.sh --help for more information"
@@ -212,23 +505,11 @@ else
         exit 1
     fi
 
-    # Check if patch file exists
     if [ ! -f "$PATCH_FILE" ]; then
-        echo "❌ ERROR: Patch file '$PATCH_FILE' not found"
+        log_error "Patch file '$PATCH_FILE' not found"
         exit 1
     fi
 
-    # Try to extract patch date from the patch file (optional)
-    PATCH_DATE=$(grep "^Date:" "$PATCH_FILE" | head -1 | sed 's/Date: //')
-    if [ -n "$PATCH_DATE" ]; then
-        echo "📅 Found patch date: $PATCH_DATE"
-        USE_DATE_SEARCH=true
-    else
-        echo "ℹ️  No Date field found - will search commit history"
-        USE_DATE_SEARCH=false
-    fi
-
-    # Save state for potential resume
     save_state
 
     echo "📋 Rerolling Patch"
@@ -238,223 +519,30 @@ else
     echo "🎯 Target branch: $TARGET_BRANCH"
     echo ""
 
-    # Step 1: Ensure we're on the target branch
+    # Switch to target branch
     echo "🔄 Switching to $TARGET_BRANCH..."
     if ! git checkout "$TARGET_BRANCH"; then
-        echo "❌ ERROR: Could not checkout branch '$TARGET_BRANCH'"
+        log_error "Could not checkout branch '$TARGET_BRANCH'"
         echo "Make sure the branch exists"
         clear_state
         exit 1
     fi
 
-    # Step 2: Check if patch already applies (no reroll needed)
-    echo "🔍 Checking if patch applies cleanly..."
-    if git apply --check "$PATCH_FILE" 2>/dev/null; then
-        echo "✅ SUCCESS: Patch applies cleanly! No reroll needed."
-        echo ""
-        echo "ℹ️  You can apply this patch with: git apply $PATCH_FILE"
-        clear_state
-        exit 0
-    fi
-    echo "❌ Patch doesn't apply. Proceeding with reroll..."
+    check_patch_applies
+    find_historical_commit
+    create_test_branch
+    apply_patch_to_history
+    rebase_onto_target
+    generate_rerolled_patch
+    restore_original_branch
+
     echo ""
-
-    # Step 3: Find the historical commit where the patch can be applied
-    if [ "$USE_DATE_SEARCH" == "true" ]; then
-        echo "🔍 Finding historical commit from patch date..."
-        HISTORICAL_COMMIT=$(git log --before="$PATCH_DATE" --format="%H" -1)
-        if [ -z "$HISTORICAL_COMMIT" ]; then
-            echo "❌ ERROR: Could not find a commit before the patch date"
-            echo "The patch might be older than your git history"
-            clear_state
-            exit 1
-        fi
-        HISTORICAL_COMMIT_SHORT=$(echo $HISTORICAL_COMMIT | cut -c1-7)
-        echo "📌 Found commit: $HISTORICAL_COMMIT_SHORT"
-        echo ""
-    else
-        echo "🔍 Searching for historical commit where patch applies..."
-        echo "   Using binary search through commit history..."
-
-        # Get all commits in reverse chronological order
-        ALL_COMMITS=($(git log --format="%H" -1000))
-        TOTAL_COMMITS=${#ALL_COMMITS[@]}
-
-        echo "   Searching through last $TOTAL_COMMITS commits..."
-
-        # First, check if patch applies to the oldest commit in our range
-        oldest_commit="${ALL_COMMITS[$((TOTAL_COMMITS-1))]}"
-        if ! git checkout -q "$oldest_commit" 2>/dev/null || ! git apply --check "$PATCH_FILE" 2>/dev/null; then
-            git checkout -q "$TARGET_BRANCH" 2>/dev/null
-            echo "❌ ERROR: Patch doesn't apply even to the oldest commit in range"
-            echo "   Searched the last $TOTAL_COMMITS commits without finding a match"
-            echo ""
-            echo "This could mean:"
-            echo "  - The patch is for a different branch"
-            echo "  - The patch is very old (>1000 commits)"
-            echo "  - The patch file is corrupted"
-            clear_state
-            exit 1
-        fi
-
-        echo "   ✓ Patch applies to oldest commit, searching for most recent..."
-
-        # Binary search to find the most recent commit where patch applies
-        # left = doesn't apply (newer), right = applies (older)
-        left=0
-        right=$((TOTAL_COMMITS - 1))
-        result_index=$right
-
-        while [ $left -le $right ]; do
-            mid=$(((left + right) / 2))
-            commit="${ALL_COMMITS[$mid]}"
-
-            echo "   Testing commit $((mid+1))/$TOTAL_COMMITS..."
-
-            if git checkout -q "$commit" 2>/dev/null && git apply --check "$PATCH_FILE" 2>/dev/null; then
-                # Patch applies - this could be our answer, but try to find a more recent one
-                result_index=$mid
-                right=$((mid - 1))  # Search in newer commits (lower indices)
-            else
-                # Patch doesn't apply - search in older commits (higher indices)
-                left=$((mid + 1))
-            fi
-        done
-
-        HISTORICAL_COMMIT="${ALL_COMMITS[$result_index]}"
-
-        # Return to target branch
-        git checkout -q "$TARGET_BRANCH" 2>/dev/null
-
-        HISTORICAL_COMMIT_SHORT=$(echo $HISTORICAL_COMMIT | cut -c1-7)
-        echo "✅ Found most recent applicable commit: $HISTORICAL_COMMIT_SHORT (commit $((result_index+1))/$TOTAL_COMMITS)"
-        echo ""
-    fi
-
-    # Step 4: Create test branch from historical commit
-    echo "🌿 Creating test branch: $TEST_BRANCH"
-
-    # Check if test branch already exists
-    if git rev-parse --verify "$TEST_BRANCH" >/dev/null 2>&1; then
-        echo "⚠️  WARNING: Branch '$TEST_BRANCH' already exists"
-        echo "Do you want to delete it and continue? (y/n)"
-        read -r response
-        if [ "$response" != "y" ]; then
-            echo "Aborted."
-            clear_state
-            exit 1
-        fi
-        git branch -D "$TEST_BRANCH"
-    fi
-
-    git checkout -b "$TEST_BRANCH" "$HISTORICAL_COMMIT"
-    echo ""
-
-    # Step 5: Apply patch to old code
-    echo "📝 Applying patch to historical code..."
-    if ! git apply --index "$PATCH_FILE"; then
-        echo "❌ ERROR: Patch doesn't even apply to historical code!"
-        echo ""
-        echo "This could mean:"
-        echo "  - The patch date is incorrect"
-        echo "  - The patch is for a different branch"
-        echo "  - The patch file is corrupted"
-        echo ""
-        echo "🧹 Cleaning up..."
-        git checkout "$TARGET_BRANCH"
-        git branch -D "$TEST_BRANCH"
-        clear_state
-        exit 1
-    fi
-    echo "✅ Patch applied to historical code"
-    echo ""
-
-    # Step 6: Commit the changes
-    echo "💾 Committing patch..."
-    git commit -m "Applying patch from issue $ISSUE_NUMBER"
-    echo ""
-
-    # Step 7: Rebase onto current branch
-    echo "🔀 Rebasing onto $TARGET_BRANCH..."
-    echo "This may take a moment..."
-    if git rebase "$TARGET_BRANCH"; then
-        echo "✅ Rebase successful! No conflicts."
-        echo ""
-    else
-        echo ""
-        echo "⚠️  ════════════════════════════════════════════════════════"
-        echo "⚠️  CONFLICTS DETECTED - Manual Resolution Required"
-        echo "⚠️  ════════════════════════════════════════════════════════"
-        echo ""
-        echo "📝 To resolve conflicts:"
-        echo "   1. Edit the conflicted files (look for <<<<<<< and >>>>>>>)"
-        echo "   2. Stage your changes:     git add ."
-        echo "   3. Re-run this script:     ./reroll-patch.sh $PATCH_FILE $ISSUE_NUMBER $TARGET_BRANCH"
-        echo "      OR"
-        echo "      Resume:                 ./reroll-patch.sh --resume"
-        echo ""
-        echo "To abort the rebase:          git rebase --abort"
-        echo ""
-        exit 2
-    fi
-fi
-
-# Step 8: Generate rerolled patch
-OUTPUT_PATCH="${ISSUE_NUMBER}-rerolled.patch"
-
-# Check if output patch already exists
-if [ -f "$OUTPUT_PATCH" ]; then
-    echo "⚠️  WARNING: File '$OUTPUT_PATCH' already exists"
-    echo "Do you want to overwrite it? (y/n)"
-    read -r response
-    if [ "$response" != "y" ]; then
-        echo "Aborted. Patch not created."
-        git checkout "$TARGET_BRANCH"
-        clear_state
-        exit 1
-    fi
-fi
-
-echo "📄 Generating rerolled patch: $OUTPUT_PATCH"
-git diff "$TARGET_BRANCH" "$TEST_BRANCH" > "$OUTPUT_PATCH"
-echo ""
-
-# Step 9: Verify the new patch applies
-echo "✅ Verifying rerolled patch..."
-git checkout "$TARGET_BRANCH"
-if git apply --check "$OUTPUT_PATCH"; then
-    echo "✅ SUCCESS! Rerolled patch applies cleanly."
-    echo ""
-    echo "📊 Results"
+    echo "🧹 Cleanup"
     echo "=========="
+    echo "Test branch '$TEST_BRANCH' has been created."
+    echo "To remove it:  git branch -D $TEST_BRANCH"
 
-    # Check file size
-    SIZE=$(wc -c < "$OUTPUT_PATCH")
-    echo "📄 New patch: $OUTPUT_PATCH"
-    echo "📊 Patch size: $SIZE bytes"
+    clear_state
+}
 
-    if [ "$SIZE" -eq 0 ]; then
-        echo "⚠️  WARNING: Patch file is empty!"
-    fi
-
-    echo ""
-    echo "📋 Next Steps"
-    echo "============="
-    echo "1. Review the patch:     cat $OUTPUT_PATCH"
-    echo "2. Apply it:             git apply $OUTPUT_PATCH"
-    echo "3. Test your changes"
-    echo "4. Upload to drupal.org issue #$ISSUE_NUMBER"
-    echo "5. Clean up:             git branch -D $TEST_BRANCH"
-else
-    echo "❌ ERROR: Rerolled patch doesn't apply!"
-    echo "This shouldn't happen. Please check the git history."
-fi
-
-echo ""
-echo "🧹 Cleanup"
-echo "=========="
-echo "Test branch '$TEST_BRANCH' has been created."
-echo "To remove it:  git branch -D $TEST_BRANCH"
-
-# Clear state on successful completion
-clear_state
+main "$@"
